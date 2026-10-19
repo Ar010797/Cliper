@@ -1,0 +1,6 @@
+{
+  "name": "ClipRush - Smart Video Clipper",
+  "description": "Modern client-side video clipping and editing studio with smart silence detection, auto-highlight, audio waveform timeline, and FFmpeg export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
