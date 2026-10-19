@@ -17,15 +17,16 @@ import {
   Square,
   Flame,
   Check,
-  Smartphone,
-  Maximize2,
   Sliders,
   ShieldCheck,
   Shield,
   Zap,
-  Camera,
-  UserCheck,
-  Crosshair,
+  Tag,
+  Ban,
+  RefreshCw,
+  FileVideo,
+  ListOrdered,
+  Clock,
 } from 'lucide-react';
 import { ExportSettings, VideoClip, AntiCopyrightSettings, DEFAULT_ANTI_COPYRIGHT, ReframeMode } from '../types';
 import { AutoReframer } from '../utils/autoReframing';
@@ -33,11 +34,22 @@ import {
   renderClipsToVideo,
   RenderProgress,
   getOutputDimensions,
-  calculateFrameLayout,
-  applyFilterToContext,
-  drawTextOverlay,
   renderVideoFrameWithEffects,
 } from '../utils/exportEngine';
+import { triggerSafeDownload, formatFileSize } from '../utils/downloadHelper';
+
+export interface QueueClipItem {
+  id: string;
+  clip: VideoClip;
+  status: 'waiting' | 'rendering' | 'completed' | 'error';
+  percent: number;
+  blob?: Blob;
+  url?: string;
+  filename?: string;
+  duration: number;
+  sizeFormatted?: string;
+  error?: string;
+}
 
 interface ExportModalProps {
   isOpen: boolean;
@@ -70,16 +82,29 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   const [isPreviewMuted, setIsPreviewMuted] = useState<boolean>(false);
   const [previewVolume, setPreviewVolume] = useState<number>(1.0);
 
-  // Render & export state
+  // Render & export mode: default to 'individual' (Sequential Render Queue) for viral clipper clips
+  const [exportMode, setExportMode] = useState<'individual' | 'stitched'>('individual');
+  const [includeTagline, setIncludeTagline] = useState<boolean>(true);
+
+  // Render state
   const [isRendering, setIsRendering] = useState(false);
   const [renderProgress, setRenderProgress] = useState<RenderProgress | null>(null);
+  const [renderError, setRenderError] = useState<string | null>(null);
+
+  // Sequential render queue state
+  const [queueItems, setQueueItems] = useState<QueueClipItem[]>([]);
+  const [currentQueueIndex, setCurrentQueueIndex] = useState<number>(-1);
+  const cancelQueueRef = useRef<boolean>(false);
+
+  // Single/stitched export result
   const [exportResult, setExportResult] = useState<{
     blob: Blob;
     url: string;
     filename: string;
   } | null>(null);
-  const [exportMode, setExportMode] = useState<'stitched' | 'individual' | 'single'>('stitched');
-  const [renderError, setRenderError] = useState<string | null>(null);
+
+  // Download all in progress state
+  const [isDownloadingAll, setIsDownloadingAll] = useState<boolean>(false);
 
   // Anti-Copyright settings accessor
   const antiSettings: AntiCopyrightSettings = settings.antiCopyright || DEFAULT_ANTI_COPYRIGHT;
@@ -143,7 +168,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     });
   }, [settings.reframeMode, settings.reframeSmoothing, settings.manualFocalX]);
 
-  // Real-time canvas render loop for WYSIWYG preview
+  // Real-time canvas render loop for WYSIWYG preview (reflects includeTagline in real time)
   useEffect(() => {
     if (!isOpen) return;
 
@@ -178,14 +203,27 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             focalPoint = { x: cam.currentFocalX, y: cam.currentFocalY };
           }
 
+          const effectiveTagline = includeTagline ? (activeClip?.tagline || settings.overlay.text || '') : '';
+          const effectiveBadge = includeTagline ? (activeClip?.taglineBadge || settings.overlay.taglineBadge || '') : '';
+
+          const previewSettings: ExportSettings = {
+            ...settings,
+            overlay: {
+              ...settings.overlay,
+              enabled: includeTagline && Boolean(effectiveTagline),
+              text: effectiveTagline,
+              taglineBadge: effectiveBadge,
+            },
+          };
+
           renderVideoFrameWithEffects(
             ctx,
             pVideo,
             dims.width,
             dims.height,
-            settings,
-            activeClip?.tagline || settings.overlay.text,
-            activeClip?.taglineBadge || settings.overlay.taglineBadge,
+            previewSettings,
+            effectiveTagline,
+            effectiveBadge,
             focalPoint
           );
         }
@@ -205,7 +243,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
     animId = requestAnimationFrame(renderFrame);
     return () => cancelAnimationFrame(animId);
-  }, [isOpen, settings, activePreviewClipId, clips]);
+  }, [isOpen, settings, activePreviewClipId, clips, includeTagline]);
 
   if (!isOpen) return null;
 
@@ -294,18 +332,43 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     }
   };
 
-  // Calculate target clips based on mode
-  const effectiveClipsToExport: VideoClip[] =
-    exportMode === 'single'
-      ? currentPreviewClip ? [currentPreviewClip] : []
-      : clips.filter((c) => selectedClipIds.has(c.id));
+  // Target clips to export
+  const effectiveClipsToExport: VideoClip[] = clips.filter((c) => selectedClipIds.has(c.id));
 
   const totalExportDuration = effectiveClipsToExport.reduce(
     (acc, c) => acc + (c.endTime - c.startTime),
     0
   );
 
-  // Trigger export
+  const completedQueueCount = queueItems.filter((q) => q.status === 'completed').length;
+
+  // Cancel sequential queue
+  const handleCancelQueue = () => {
+    cancelQueueRef.current = true;
+    setIsRendering(false);
+    setCurrentQueueIndex(-1);
+  };
+
+  // Trigger download of all completed clips with safe delays so mobile browser does not block them
+  const handleDownloadAllCompleted = async () => {
+    const completedItems = queueItems.filter((q) => q.status === 'completed' && q.blob && q.filename);
+    if (completedItems.length === 0) return;
+
+    setIsDownloadingAll(true);
+    for (let i = 0; i < completedItems.length; i++) {
+      const item = completedItems[i];
+      if (item.blob && item.filename) {
+        triggerSafeDownload(item.blob, item.filename);
+      }
+      if (i < completedItems.length - 1) {
+        // 800ms delay between files to respect mobile Chrome anti-spam popup policies
+        await new Promise((r) => setTimeout(r, 800));
+      }
+    }
+    setIsDownloadingAll(false);
+  };
+
+  // Execute Export / Sequential Render Queue
   const startExport = async (singleClipOverride?: VideoClip) => {
     if (!videoElement) {
       setRenderError('Video element tidak siap.');
@@ -330,46 +393,153 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     setIsRendering(true);
     setRenderError(null);
     setExportResult(null);
+    cancelQueueRef.current = false;
 
-    try {
-      if (exportMode === 'individual' && !singleClipOverride && targetClips.length > 1) {
-        // Render each clip one by one
-        for (let i = 0; i < targetClips.length; i++) {
-          const singleClip = targetClips[i];
+    // Base settings with tagline toggle respected
+    const baseEffectiveSettings: ExportSettings = {
+      ...settings,
+      overlay: {
+        ...settings.overlay,
+        enabled: includeTagline && Boolean(settings.overlay.enabled),
+        text: includeTagline ? settings.overlay.text : '',
+      },
+    };
+
+    if (exportMode === 'individual' || (!singleClipOverride && targetClips.length > 1)) {
+      // ========================================================
+      // SEQUENTIAL RENDER QUEUE PROCESS
+      // ========================================================
+      const initialQueue: QueueClipItem[] = targetClips.map((c) => ({
+        id: c.id,
+        clip: c,
+        status: 'waiting',
+        percent: 0,
+        duration: Math.max(0.1, c.endTime - c.startTime),
+      }));
+      setQueueItems(initialQueue);
+
+      const completedResults: QueueClipItem[] = [];
+
+      for (let i = 0; i < targetClips.length; i++) {
+        if (cancelQueueRef.current) break;
+
+        setCurrentQueueIndex(i);
+        const singleClip = targetClips[i];
+
+        // Update status of current item in queue
+        setQueueItems((prev) =>
+          prev.map((item, idx) =>
+            idx === i ? { ...item, status: 'rendering', percent: 5 } : item
+          )
+        );
+
+        try {
+          const clipEffectiveSettings: ExportSettings = {
+            ...baseEffectiveSettings,
+            overlay: {
+              ...baseEffectiveSettings.overlay,
+              enabled: includeTagline && Boolean(singleClip.tagline || baseEffectiveSettings.overlay.text),
+              text: includeTagline ? (singleClip.tagline || baseEffectiveSettings.overlay.text) : '',
+              taglineBadge: includeTagline ? (singleClip.taglineBadge || baseEffectiveSettings.overlay.taglineBadge) : '',
+            },
+          };
+
           const res = await renderClipsToVideo(
             videoElement,
             [singleClip],
-            settings,
+            clipEffectiveSettings,
             (prog) => {
               setRenderProgress({
                 ...prog,
-                status: `Merender klip ${i + 1}/${targetClips.length} (${singleClip.name})...`,
+                currentClipIndex: i + 1,
+                totalClips: targetClips.length,
+                status: `Merender antrean klip ${i + 1}/${targetClips.length}: "${singleClip.name}"...`,
               });
+              setQueueItems((prev) =>
+                prev.map((item, idx) =>
+                  idx === i ? { ...item, percent: prog.percent } : item
+                )
+              );
             }
           );
 
-          // Download each file
-          const url = URL.createObjectURL(res.blob);
-          const a = document.createElement('a');
-          a.href = url;
-          const cleanName = (singleClip.name || `clip_${i + 1}`).replace(/[^a-zA-Z0-9_-]/g, '_');
-          a.download = `cliprush_${cleanName}_${i + 1}.${settings.format === 'webm' ? 'webm' : 'mp4'}`;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-        }
+          if (cancelQueueRef.current) break;
 
-        setExportResult({
-          blob: new Blob([]),
-          url: '',
-          filename: `Semua ${targetClips.length} klip pilihan berhasil diunduh.`,
-        });
-      } else {
-        // Combined stitched or single clip
+          // Save rendered video blob and URL
+          const url = URL.createObjectURL(res.blob);
+          const cleanName = (singleClip.name || `klip_${i + 1}`).replace(/[^a-zA-Z0-9_-]/g, '_');
+          const ext = settings.format === 'webm' ? 'webm' : 'mp4';
+          const filename = `cliprush_${cleanName}_${i + 1}.${ext}`;
+          const sizeFormatted = formatFileSize(res.blob.size);
+
+          const completedItem: QueueClipItem = {
+            id: singleClip.id,
+            clip: singleClip,
+            status: 'completed',
+            percent: 100,
+            blob: res.blob,
+            url,
+            filename,
+            duration: Math.max(0.1, singleClip.endTime - singleClip.startTime),
+            sizeFormatted,
+          };
+
+          completedResults.push(completedItem);
+
+          setQueueItems((prev) =>
+            prev.map((item, idx) => (idx === i ? completedItem : item))
+          );
+
+          // Attempt automatic download for current clip
+          triggerSafeDownload(res.blob, filename);
+
+          // Brief delay between renders to reset media codecs and ensure mobile RAM stability
+          await new Promise((r) => setTimeout(r, 450));
+        } catch (clipErr) {
+          console.error(`Error rendering clip ${singleClip.name}:`, clipErr);
+          setQueueItems((prev) =>
+            prev.map((item, idx) =>
+              idx === i
+                ? {
+                    ...item,
+                    status: 'error',
+                    error: (clipErr as Error).message || 'Gagal memproses render klip ini.',
+                  }
+                : item
+            )
+          );
+        }
+      }
+
+      setIsRendering(false);
+      setCurrentQueueIndex(-1);
+
+      if (completedResults.length > 0) {
+        onSaveHistory(
+          `${completedResults.length} Klip Terpisah`,
+          completedResults.reduce((acc, c) => acc + c.duration, 0),
+          completedResults.length
+        );
+      }
+    } else {
+      // ========================================================
+      // STITCHED (1 SINGLE COMBINED VIDEO) PROCESS
+      // ========================================================
+      try {
+        const clipEffectiveSettings: ExportSettings = {
+          ...baseEffectiveSettings,
+          overlay: {
+            ...baseEffectiveSettings.overlay,
+            enabled: includeTagline && Boolean(targetClips[0]?.tagline || baseEffectiveSettings.overlay.text),
+            text: includeTagline ? (targetClips[0]?.tagline || baseEffectiveSettings.overlay.text) : '',
+            taglineBadge: includeTagline ? (targetClips[0]?.taglineBadge || baseEffectiveSettings.overlay.taglineBadge) : '',
+          },
+        };
+
         const result = await renderClipsToVideo(
           videoElement,
           targetClips,
-          settings,
+          clipEffectiveSettings,
           (prog) => setRenderProgress(prog)
         );
 
@@ -380,27 +550,21 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           filename: result.filename,
         });
 
-        // Trigger auto download
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = result.filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+        // Trigger safe download
+        triggerSafeDownload(result.blob, result.filename);
 
-        // Record history
         onSaveHistory(
           result.filename,
-          targetClips.reduce((acc, c) => acc + (c.endTime - c.startTime), 0) / (settings.playbackSpeed || 1),
+          totalExportDuration / (settings.playbackSpeed || 1),
           targetClips.length
         );
+      } catch (err: unknown) {
+        const error = err as Error;
+        console.error('Export error:', error);
+        setRenderError(error.message || 'Gagal memproses render video.');
+      } finally {
+        setIsRendering(false);
       }
-    } catch (err: unknown) {
-      const error = err as Error;
-      console.error('Export error:', error);
-      setRenderError(error.message || 'Gagal memproses render video.');
-    } finally {
-      setIsRendering(false);
     }
   };
 
@@ -421,22 +585,27 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         className="hidden"
       />
 
-      <div className="glass-panel w-full max-w-5xl rounded-3xl border border-white/10 overflow-hidden shadow-2xl flex flex-col max-h-[92vh]">
+      <div className="glass-panel w-full max-w-5xl rounded-3xl border border-white/10 overflow-hidden shadow-2xl flex flex-col max-h-[92vh] bg-[#0c0c14]/98">
         {/* Header */}
-        <div className="px-6 py-4 border-b border-white/10 flex items-center justify-between bg-black/40">
+        <div className="px-5 sm:px-6 py-4 border-b border-white/10 flex items-center justify-between bg-black/40">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-violet-600 to-cyan-500 flex items-center justify-center text-white shadow-lg">
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-violet-600 via-indigo-600 to-cyan-500 flex items-center justify-center text-white shadow-lg shrink-0">
               <Download className="w-5 h-5" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
-                <h2 className="font-heading font-bold text-base text-white">Export & Download Video</h2>
+              <div className="flex items-center gap-2 flex-wrap">
+                <h2 className="font-heading font-bold text-sm sm:text-base text-white">
+                  Studio Export & Antrean Render Video
+                </h2>
                 <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
-                  Real-Time Studio
+                  Sequential Queue Ready
+                </span>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                  Anti-Copyright FB
                 </span>
               </div>
               <p className="text-xs text-slate-400">
-                Pratinjau langsung, pilih klip yang diinginkan, framing 9:16 rapi, suara utuh tidak dimute
+                Pilih beberapa klip untuk dirender berurutan ke file terpisah atau gabungkan menjadi satu video utuh
               </p>
             </div>
           </div>
@@ -449,18 +618,29 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           </button>
         </div>
 
-        {/* Content Body: Split into Left (Live Preview) and Right (Options & Clip Picker) */}
-        <div className="p-5 overflow-y-auto space-y-5 flex-1 grid grid-cols-1 lg:grid-cols-12 gap-5">
+        {/* Content Body */}
+        <div className="p-4 sm:p-5 overflow-y-auto space-y-5 flex-1 grid grid-cols-1 lg:grid-cols-12 gap-5">
           {/* ================= LEFT COLUMN: REAL-TIME PREVIEW PLAYER (5 cols) ================= */}
           <div className="lg:col-span-5 flex flex-col space-y-3">
             <div className="flex items-center justify-between">
               <span className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
                 <Eye className="w-4 h-4 text-cyan-400" />
-                <span>Pratinjau Real-Time (WYSIWYG)</span>
+                <span>Pratinjau Hasil (WYSIWYG)</span>
               </span>
-              <span className="text-[11px] font-mono text-cyan-400">
-                {settings.aspectRatio} • {settings.fitMode}
-              </span>
+              <div className="flex items-center gap-1.5">
+                {!includeTagline ? (
+                  <span className="text-[10px] font-mono text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded-full border border-amber-500/20">
+                    Video Bersih (Tanpa Teks)
+                  </span>
+                ) : (
+                  <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20">
+                    Tegline Aktif
+                  </span>
+                )}
+                <span className="text-[11px] font-mono text-cyan-400">
+                  {settings.aspectRatio}
+                </span>
+              </div>
             </div>
 
             {/* Interactive Preview Canvas Frame */}
@@ -472,12 +652,12 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
               {/* Top watermark badge */}
               <div className="absolute top-2.5 left-2.5 pointer-events-none">
-                <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-black/60 text-slate-300 border border-white/10 backdrop-blur-sm">
+                <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-black/70 text-slate-300 border border-white/10 backdrop-blur-sm">
                   Klip: {currentPreviewClip?.name || 'Utuh'}
                 </span>
               </div>
 
-              {/* 9:16 safe framing badge indicator */}
+              {/* Safe framing indicator */}
               {settings.aspectRatio === '9:16' && (
                 <div className="absolute top-2.5 right-2.5 pointer-events-none">
                   <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 backdrop-blur-sm flex items-center gap-1">
@@ -491,7 +671,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               {!isPreviewPlaying && (
                 <button
                   onClick={togglePreviewPlay}
-                  className="absolute inset-0 m-auto w-12 h-12 rounded-full bg-violet-600/80 hover:bg-violet-600 text-white flex items-center justify-center shadow-xl cursor-pointer transition hover:scale-110 active:scale-95"
+                  className="absolute inset-0 m-auto w-12 h-12 rounded-full bg-violet-600/80 hover:bg-violet-600 text-white flex items-center justify-center shadow-xl cursor-pointer transition hover:scale-110 active:scale-95 z-20"
                   title="Putar Pratinjau"
                 >
                   <Play className="w-6 h-6 ml-0.5" />
@@ -520,7 +700,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 </div>
 
                 {/* Timecode within active clip */}
-                <span className="text-[11px] font-mono text-slate-400">
+                <span className="text-[11px] font-mono text-slate-300 font-semibold">
                   {currentPreviewClip
                     ? `${formatSec(Math.max(0, previewTime - currentPreviewClip.startTime))} / ${formatSec(currentPreviewClip.endTime - currentPreviewClip.startTime)}`
                     : '00:00'}
@@ -567,75 +747,186 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 </div>
               )}
 
-              {/* Audio & Motion Quality Reassurance */}
+              {/* Quality reassurance */}
               <div className="text-[10px] text-emerald-400 flex items-center gap-1.5 pt-1">
                 <Check className="w-3.5 h-3.5 shrink-0" />
-                <span>Suara video aktif 100% (tidak dimute) & gerakan sinkron saat export</span>
+                <span>Suara video aktif 100% & gerakan sinkron otomatis saat diunduh</span>
               </div>
             </div>
           </div>
 
-          {/* ================= RIGHT COLUMN: CLIP SELECTION & EXPORT SETTINGS (7 cols) ================= */}
+          {/* ================= RIGHT COLUMN: SETTINGS, QUEUE & DOWNLOADS (7 cols) ================= */}
           <div className="lg:col-span-7 space-y-4">
-            {/* Active Result Banner */}
-            {exportResult && (
-              <div className="glass-card rounded-2xl p-4 border border-emerald-500/30 bg-emerald-950/20 text-center space-y-3">
+            {/* ================= LIVE SEQUENTIAL RENDER QUEUE DISPLAY ================= */}
+            {queueItems.length > 0 && (
+              <div className="glass-card rounded-2xl p-4 border border-cyan-500/40 bg-[#0c1424] space-y-3 shadow-xl">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <div className="flex items-center gap-2">
+                    <div className="w-7 h-7 rounded-lg bg-cyan-500/20 text-cyan-300 flex items-center justify-center">
+                      <ListOrdered className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <h4 className="font-heading font-bold text-xs sm:text-sm text-white flex items-center gap-2">
+                        <span>Antrean Render Berurutan</span>
+                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-200 border border-cyan-500/40">
+                          {completedQueueCount} / {queueItems.length} Selesai
+                        </span>
+                      </h4>
+                      <p className="text-[10px] text-slate-300">
+                        {isRendering
+                          ? `Sedang memproses antrean klip ${currentQueueIndex + 1} dari ${queueItems.length}...`
+                          : completedQueueCount === queueItems.length
+                          ? 'Semua klip telah selesai dirender dan siap disimpan ke HP/komputer!'
+                          : 'Proses antrean render selesai.'}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Actions for completed queue */}
+                  <div className="flex items-center gap-1.5">
+                    {completedQueueCount > 0 && (
+                      <button
+                        onClick={handleDownloadAllCompleted}
+                        disabled={isDownloadingAll}
+                        className="px-3 py-1.5 rounded-xl font-bold text-xs bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 shadow-md flex items-center gap-1.5 cursor-pointer transition active:scale-95 disabled:opacity-50"
+                        title="Unduh seluruh file klip yang sudah selesai dirender ke perangkat"
+                      >
+                        <Download className={`w-3.5 h-3.5 ${isDownloadingAll ? 'animate-bounce' : ''}`} />
+                        <span>{isDownloadingAll ? 'Mengunduh...' : `Download Semua (${completedQueueCount} Klip)`}</span>
+                      </button>
+                    )}
+
+                    {isRendering && (
+                      <button
+                        onClick={handleCancelQueue}
+                        className="px-2.5 py-1 rounded-xl bg-red-500/20 hover:bg-red-500/30 text-red-300 text-xs font-semibold border border-red-500/40 cursor-pointer"
+                      >
+                        Batal
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Queue Items List with Individual Direct Download Buttons */}
+                <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                  {queueItems.map((item, qIdx) => {
+                    const isCurrent = currentQueueIndex === qIdx;
+                    const isDone = item.status === 'completed';
+                    const isErr = item.status === 'error';
+
+                    return (
+                      <div
+                        key={item.id}
+                        className={`p-2.5 rounded-xl border transition flex items-center justify-between gap-2.5 text-xs ${
+                          isDone
+                            ? 'bg-emerald-950/30 border-emerald-500/40'
+                            : isCurrent
+                            ? 'bg-cyan-950/40 border-cyan-400 shadow-md animate-pulse'
+                            : isErr
+                            ? 'bg-red-950/30 border-red-500/40'
+                            : 'bg-black/30 border-white/5 opacity-70'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <span className="font-mono font-bold text-slate-400 w-5 shrink-0">
+                            #{qIdx + 1}
+                          </span>
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className="font-bold text-white truncate max-w-[170px] sm:max-w-[220px]">
+                                {item.clip.name}
+                              </span>
+                              <span className="text-[10px] text-slate-400 font-mono">
+                                ({item.duration.toFixed(1)}s)
+                              </span>
+                            </div>
+
+                            {/* Status label */}
+                            <div className="text-[10px] mt-0.5">
+                              {isDone ? (
+                                <span className="text-emerald-300 font-semibold flex items-center gap-1">
+                                  <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                                  <span>Selesai • {item.sizeFormatted || 'Siap'}</span>
+                                </span>
+                              ) : isCurrent ? (
+                                <span className="text-cyan-300 font-bold flex items-center gap-1">
+                                  <Sparkles className="w-3 h-3 animate-spin text-cyan-400" />
+                                  <span>Sedang dirender ({item.percent}%)</span>
+                                </span>
+                              ) : isErr ? (
+                                <span className="text-red-300">{item.error || 'Gagal'}</span>
+                              ) : (
+                                <span className="text-slate-400 flex items-center gap-1">
+                                  <Clock className="w-3 h-3" />
+                                  <span>Menunggu giliran antrean...</span>
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Direct Download Button for Each Completed Clip */}
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {isDone && item.url && item.filename && (
+                            <a
+                              href={item.url}
+                              download={item.filename}
+                              className="px-3 py-1.5 rounded-xl font-bold text-xs bg-emerald-500 hover:bg-emerald-400 text-slate-950 flex items-center gap-1.5 shadow-md transition cursor-pointer active:scale-95"
+                              title="Klik untuk langsung menyimpan file ini ke HP / Komputer"
+                            >
+                              <Download className="w-3.5 h-3.5" />
+                              <span>Simpan File</span>
+                            </a>
+                          )}
+                          {isDone && item.url && (
+                            <button
+                              onClick={() => {
+                                if (previewVideoRef.current) {
+                                  previewVideoRef.current.src = item.url!;
+                                  previewVideoRef.current.currentTime = 0;
+                                  previewVideoRef.current.play().catch(() => {});
+                                  setIsPreviewPlaying(true);
+                                }
+                              }}
+                              className="p-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-slate-300 hover:text-white cursor-pointer transition"
+                              title="Tonton hasil render file ini di pemutar"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Stitched Single Video Result Card (if exported in stitched mode) */}
+            {exportResult && exportResult.url && (
+              <div className="glass-card rounded-2xl p-4 border border-emerald-500/40 bg-emerald-950/20 text-center space-y-3">
                 <div className="w-10 h-10 rounded-full bg-emerald-500/20 text-emerald-400 mx-auto flex items-center justify-center shadow-lg">
                   <CheckCircle2 className="w-5 h-5" />
                 </div>
                 <div>
                   <h4 className="font-heading font-bold text-emerald-300 text-sm">
-                    Video Siap Diunduh!
+                    Video Siap Disimpan!
                   </h4>
                   <p className="text-xs text-slate-300 mt-0.5">{exportResult.filename}</p>
                 </div>
 
-                {exportResult.url && (
-                  <div className="max-w-xs mx-auto aspect-video rounded-xl overflow-hidden border border-white/10 bg-black">
-                    <video src={exportResult.url} controls className="w-full h-full object-contain" />
-                  </div>
-                )}
-
-                {exportResult.url && (
-                  <a
-                    href={exportResult.url}
-                    download={exportResult.filename}
-                    className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl font-bold text-xs bg-emerald-500 hover:bg-emerald-400 text-slate-950 transition shadow-lg"
-                  >
-                    <Download className="w-4 h-4" />
-                    <span>Download Ulang File</span>
-                  </a>
-                )}
-              </div>
-            )}
-
-            {/* Render Progress Overlay */}
-            {isRendering && renderProgress && (
-              <div className="glass-card rounded-2xl p-4 border border-cyan-500/30 bg-cyan-950/20 space-y-2.5">
-                <div className="flex items-center justify-between text-xs">
-                  <span className="font-bold text-cyan-300 flex items-center gap-2">
-                    <Sparkles className="w-4 h-4 animate-spin" />
-                    <span>{renderProgress.status}</span>
-                  </span>
-                  <span className="font-mono font-bold text-cyan-300 text-sm">
-                    {renderProgress.percent}%
-                  </span>
+                <div className="max-w-xs mx-auto aspect-video rounded-xl overflow-hidden border border-white/10 bg-black">
+                  <video src={exportResult.url} controls className="w-full h-full object-contain" />
                 </div>
 
-                {/* Progress Bar */}
-                <div className="h-2 w-full bg-black/60 rounded-full overflow-hidden border border-white/5">
-                  <div
-                    className="h-full bg-gradient-to-r from-violet-500 via-indigo-500 to-cyan-400 transition-all duration-200"
-                    style={{ width: `${renderProgress.percent}%` }}
-                  />
-                </div>
-
-                <div className="flex justify-between text-[11px] text-slate-400 font-mono">
-                  <span>Estimasi sisa waktu: {renderProgress.timeRemaining || 'menghitung...'}</span>
-                  <span>
-                    Klip {renderProgress.currentClipIndex || 1} / {renderProgress.totalClips || effectiveClipsToExport.length}
-                  </span>
-                </div>
+                <button
+                  type="button"
+                  onClick={() => triggerSafeDownload(exportResult.blob, exportResult.filename)}
+                  className="inline-flex items-center gap-2 px-6 py-2.5 rounded-xl font-bold text-xs bg-gradient-to-r from-emerald-500 to-teal-400 hover:from-emerald-400 hover:to-teal-300 text-slate-950 transition shadow-lg shadow-emerald-500/20 active:scale-95 cursor-pointer"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>Simpan Video ke Perangkat Sekarang</span>
+                </button>
               </div>
             )}
 
@@ -647,28 +938,125 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               </div>
             )}
 
-            {/* 1. SELEKSI HASIL KLIP SEBELUM DOWNLOAD */}
+            {/* ================= 1. PILIHAN MODE EXPORT ================= */}
+            <div>
+              <label className="text-xs font-bold text-slate-300 uppercase tracking-wider block mb-1.5">
+                Mode Proses Export
+              </label>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => setExportMode('individual')}
+                  disabled={isRendering}
+                  className={`p-3 rounded-2xl border text-left transition cursor-pointer ${
+                    exportMode === 'individual'
+                      ? 'bg-violet-600/30 border-cyan-400 text-white shadow-md'
+                      : 'bg-white/5 border-white/5 text-slate-400 hover:text-white'
+                  }`}
+                >
+                  <div className="text-xs font-bold flex items-center gap-1.5 text-cyan-300">
+                    <ListOrdered className="w-4 h-4" />
+                    <span>Antrean Klip Terpisah (Sequential Queue)</span>
+                  </div>
+                  <div className="text-[10px] text-slate-400 mt-0.5">
+                    Render klip satu per satu secara berurutan dan unduh sebagai file terpisah siap upload.
+                  </div>
+                </button>
+
+                <button
+                  onClick={() => setExportMode('stitched')}
+                  disabled={isRendering}
+                  className={`p-3 rounded-2xl border text-left transition cursor-pointer ${
+                    exportMode === 'stitched'
+                      ? 'bg-violet-600/30 border-cyan-400 text-white shadow-md'
+                      : 'bg-white/5 border-white/5 text-slate-400 hover:text-white'
+                  }`}
+                >
+                  <div className="text-xs font-bold flex items-center gap-1.5 text-purple-300">
+                    <Film className="w-4 h-4" />
+                    <span>Gabung Menjadi 1 Video (Stitched)</span>
+                  </div>
+                  <div className="text-[10px] text-slate-400 mt-0.5">
+                    Sambungkan seluruh klip yang dipilih menjadi 1 video panjang berurutan.
+                  </div>
+                </button>
+              </div>
+            </div>
+
+            {/* ================= 2. PILIHAN TEGLINE: DENGAN TEGLINE vs TANPA TEGLINE ================= */}
+            <div className="glass-card rounded-2xl p-3.5 border border-white/10 bg-black/40 space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-bold text-slate-200 uppercase tracking-wider flex items-center gap-1.5">
+                  <Tag className="w-4 h-4 text-amber-400" />
+                  <span>Pilihan Tegline Video (Sesuai Isi Video)</span>
+                </label>
+                <span className="text-[10px] text-slate-400">
+                  {includeTagline ? 'Tegline Aktif' : 'Video Bersih'}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 pt-0.5">
+                <button
+                  type="button"
+                  onClick={() => setIncludeTagline(true)}
+                  disabled={isRendering}
+                  className={`p-2.5 rounded-xl border text-left transition cursor-pointer flex items-center gap-2.5 ${
+                    includeTagline
+                      ? 'bg-amber-500/25 border-amber-500/60 text-amber-200 shadow-md font-bold'
+                      : 'bg-white/5 border-white/5 text-slate-400 hover:text-white'
+                  }`}
+                >
+                  <div className="w-6 h-6 rounded-lg bg-amber-500/20 text-amber-400 flex items-center justify-center shrink-0">
+                    <Tag className="w-3.5 h-3.5" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-xs">Sertakan Tegline Klip</div>
+                    <div className="text-[9px] text-slate-400 truncate">Hook & judul sesuai isi video</div>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setIncludeTagline(false)}
+                  disabled={isRendering}
+                  className={`p-2.5 rounded-xl border text-left transition cursor-pointer flex items-center gap-2.5 ${
+                    !includeTagline
+                      ? 'bg-cyan-500/25 border-cyan-400 text-cyan-200 shadow-md font-bold'
+                      : 'bg-white/5 border-white/5 text-slate-400 hover:text-white'
+                  }`}
+                >
+                  <div className="w-6 h-6 rounded-lg bg-cyan-500/20 text-cyan-400 flex items-center justify-center shrink-0">
+                    <Ban className="w-3.5 h-3.5" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-xs">Tanpa Tegline (Video Polos)</div>
+                    <div className="text-[9px] text-slate-400 truncate">Video bersih tanpa teks/overlay</div>
+                  </div>
+                </button>
+              </div>
+            </div>
+
+            {/* ================= 3. SELEKSI HASIL KLIP SEBELUM DOWNLOAD ================= */}
             <div className="glass-card rounded-2xl p-4 border border-white/10 bg-black/30 space-y-3">
               <div className="flex items-center justify-between">
                 <div>
                   <label className="text-xs font-bold text-slate-200 uppercase tracking-wider flex items-center gap-1.5">
                     <Layers className="w-4 h-4 text-violet-400" />
-                    <span>Pilihan Klip Sebelum Download</span>
+                    <span>Pilihan Klip yang Akan Diexport</span>
                   </label>
                   <p className="text-[11px] text-slate-400">
-                    Pilih klip yang ingin diexport atau klik tombol pratinjau untuk melihat hasilnya
+                    Centang klip yang ingin diproses dalam antrean export
                   </p>
                 </div>
                 <div className="flex items-center gap-1.5 text-xs">
                   <button
                     onClick={selectAllClips}
-                    className="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white text-[10px] font-semibold transition"
+                    className="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white text-[10px] font-semibold transition cursor-pointer"
                   >
                     Pilih Semua
                   </button>
                   <button
                     onClick={deselectAllClips}
-                    className="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white text-[10px] transition"
+                    className="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white text-[10px] transition cursor-pointer"
                   >
                     Reset
                   </button>
@@ -698,7 +1086,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                         <button
                           onClick={() => toggleClipSelection(clip.id)}
                           className="text-slate-400 hover:text-cyan-400 cursor-pointer shrink-0"
-                          title={isChecked ? 'Keluarkan dari export' : 'Masukkan ke export'}
+                          title={isChecked ? 'Keluarkan dari antrean' : 'Masukkan ke antrean'}
                         >
                           {isChecked ? (
                             <CheckSquare className="w-4 h-4 text-cyan-400" />
@@ -715,10 +1103,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                             {clip.viralScore && (
                               <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30 flex items-center gap-0.5">
                                 <Flame className="w-2.5 h-2.5" />
-                                {clip.viralScore}
+                                {clip.viralScore}%
                               </span>
                             )}
-                            {clip.taglineBadge && (
+                            {includeTagline && clip.taglineBadge && (
                               <span className="px-1.5 py-0.2 rounded text-[9px] font-mono bg-violet-500/20 text-violet-300 border border-violet-500/30">
                                 {clip.taglineBadge}
                               </span>
@@ -728,7 +1116,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                             <span>
                               {formatSec(clip.startTime)} - {formatSec(clip.endTime)} ({durationSec.toFixed(1)}s)
                             </span>
-                            {clip.tagline && (
+                            {includeTagline && clip.tagline && (
                               <span className="text-slate-500 truncate max-w-[150px] italic">
                                 "{clip.tagline}"
                               </span>
@@ -749,14 +1137,14 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                           title="Lihat Pratinjau Klip Ini"
                         >
                           <Eye className="w-3 h-3" />
-                          <span>{isCurrentPreview ? 'Sedang Tampil' : 'Lihat'}</span>
+                          <span>{isCurrentPreview ? 'Ditonton' : 'Lihat'}</span>
                         </button>
 
                         <button
                           onClick={() => startExport(clip)}
                           disabled={isRendering}
-                          className="px-2 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500 text-emerald-300 hover:text-slate-950 text-[10px] font-bold flex items-center gap-1 border border-emerald-500/30 cursor-pointer transition disabled:opacity-30"
-                          title="Download Hanya Klip Ini Sekarang"
+                          className="px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500 text-emerald-300 hover:text-slate-950 text-[10px] font-bold flex items-center gap-1 border border-emerald-500/30 cursor-pointer transition disabled:opacity-30"
+                          title="Render & Download Hanya Klip Ini Sekarang"
                         >
                           <Download className="w-3 h-3" />
                           <span>Download</span>
@@ -770,7 +1158,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               {/* Selection Summary */}
               <div className="flex items-center justify-between text-[11px] text-slate-400 pt-1 border-t border-white/5">
                 <span>
-                  Terpilih: <strong className="text-cyan-300">{effectiveClipsToExport.length}</strong> dari {clips.length} klip
+                  Klip Terpilih: <strong className="text-cyan-300">{effectiveClipsToExport.length}</strong> dari {clips.length}
                 </span>
                 <span>
                   Total Durasi: <strong className="text-white">{totalExportDuration.toFixed(1)}s</strong>
@@ -778,46 +1166,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               </div>
             </div>
 
-            {/* 2. MODE OUTPUT EXPORT */}
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                onClick={() => setExportMode('stitched')}
-                disabled={isRendering}
-                className={`p-2.5 rounded-2xl border text-left transition cursor-pointer ${
-                  exportMode === 'stitched'
-                    ? 'bg-violet-600/30 border-cyan-400 text-white'
-                    : 'bg-white/5 border-white/5 text-slate-400 hover:text-white'
-                }`}
-              >
-                <div className="text-xs font-bold flex items-center gap-1.5">
-                  <Film className="w-4 h-4 text-cyan-400" />
-                  <span>1 Video Utuh (Stitched)</span>
-                </div>
-                <div className="text-[10px] text-slate-400 mt-0.5">
-                  Gabungkan semua {effectiveClipsToExport.length} klip menjadi 1 video bersambung.
-                </div>
-              </button>
-
-              <button
-                onClick={() => setExportMode('individual')}
-                disabled={isRendering}
-                className={`p-2.5 rounded-2xl border text-left transition cursor-pointer ${
-                  exportMode === 'individual'
-                    ? 'bg-violet-600/30 border-cyan-400 text-white'
-                    : 'bg-white/5 border-white/5 text-slate-400 hover:text-white'
-                }`}
-              >
-                <div className="text-xs font-bold flex items-center gap-1.5">
-                  <Layers className="w-4 h-4 text-violet-400" />
-                  <span>Klip Terpisah (Batch)</span>
-                </div>
-                <div className="text-[10px] text-slate-400 mt-0.5">
-                  Unduh setiap klip yang dipilih sebagai file independen satu per satu.
-                </div>
-              </button>
-            </div>
-
-            {/* 3. PRESET RASIO ASPEK (PLATFORM TARGET) */}
+            {/* ================= 4. PRESET RASIO ASPEK (PLATFORM TARGET) ================= */}
             <div>
               <label className="text-xs font-bold text-slate-300 uppercase tracking-wider block mb-1.5">
                 Rasio Aspek Platform (Target Format)
@@ -852,7 +1201,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               </div>
             </div>
 
-            {/* 4. FRAMING & POSISI TAGLINE (NEVER COVER VIDEO) */}
+            {/* ================= 5. FRAMING & POSISI TAGLINE ================= */}
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="text-xs font-bold text-slate-300 uppercase tracking-wider block mb-1">
@@ -860,9 +1209,9 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 </label>
                 <div className="grid grid-cols-3 gap-1">
                   {[
+                    { id: 'crop', label: 'Crop (Penuh)', desc: 'Auto Reframe' },
                     { id: 'blur', label: 'Blur', desc: 'Latar blur' },
                     { id: 'letterbox', label: 'Box', desc: 'Bilah hitam' },
-                    { id: 'crop', label: 'Crop', desc: 'Isi penuh' },
                   ].map((f) => (
                     <button
                       key={f.id}
@@ -874,7 +1223,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                       }
                       className={`p-1.5 rounded-lg border text-center text-xs transition cursor-pointer ${
                         settings.fitMode === f.id
-                          ? 'bg-violet-600/30 border-violet-400 text-white'
+                          ? 'bg-violet-600/30 border-violet-400 text-white font-bold'
                           : 'bg-white/5 border-white/5 text-slate-400 hover:text-white'
                       }`}
                     >
@@ -887,7 +1236,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
               <div>
                 <label className="text-xs font-bold text-slate-300 uppercase tracking-wider block mb-1">
-                  Posisi Tagline / Teks
+                  Posisi Tagline {includeTagline ? '' : '(Nonaktif)'}
                 </label>
                 <div className="grid grid-cols-3 gap-1">
                   {[
@@ -897,6 +1246,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                   ].map((p) => (
                     <button
                       key={p.id}
+                      disabled={!includeTagline}
                       onClick={() =>
                         setSettings((prev) => ({
                           ...prev,
@@ -906,9 +1256,9 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                           },
                         }))
                       }
-                      className={`p-1.5 rounded-lg border text-center text-xs transition cursor-pointer ${
-                        settings.overlay.position === p.id
-                          ? 'bg-emerald-600/30 border-emerald-400 text-emerald-200'
+                      className={`p-1.5 rounded-lg border text-center text-xs transition cursor-pointer disabled:opacity-30 ${
+                        includeTagline && settings.overlay.position === p.id
+                          ? 'bg-emerald-600/30 border-emerald-400 text-emerald-200 font-bold'
                           : 'bg-white/5 border-white/5 text-slate-400 hover:text-white'
                       }`}
                     >
@@ -920,7 +1270,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               </div>
             </div>
 
-            {/* 5. RESOLUSI & FORMAT */}
+            {/* ================= 6. RESOLUSI & FORMAT ================= */}
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="text-xs font-bold text-slate-300 uppercase tracking-wider block mb-1">
@@ -958,53 +1308,20 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                     }))
                   }
                   disabled={isRendering}
-                  className="w-full bg-black/40 border border-white/10 rounded-xl px-2.5 py-1.5 text-xs text-white focus:outline-none cursor-pointer"
+                  className="w-full bg-black/40 border border-white/10 rounded-xl px-2.5 py-1.5 text-xs text-white focus:outline-none cursor-pointer font-mono"
                 >
-                  <option value="mp4">MP4 (H.264 Universal)</option>
-                  <option value="webm">WebM (VP9 Modern Web)</option>
+                  <option value="mp4">MP4 (H.264 / AAC Universal)</option>
+                  <option value="webm">WebM (VP9 / Opus Cepat)</option>
                 </select>
               </div>
             </div>
 
-            {/* AUTO-REFRAMING 9:16 (PAN & SCAN) */}
-            <div className="glass-card rounded-2xl p-3 border border-cyan-500/30 bg-cyan-950/20 space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold text-cyan-300 flex items-center gap-1.5">
-                  <Camera className="w-3.5 h-3.5 text-cyan-400" />
-                  <span>Auto-Reframing Pan & Scan 9:16</span>
-                </span>
-                <span className="text-[10px] font-mono text-cyan-400 font-bold">
-                  {settings.reframeMode === 'speaker' ? 'Fokus Pembicara' : settings.reframeMode === 'action' ? 'Fokus Aksi' : settings.reframeMode === 'center' ? 'Kunci Tengah' : 'Auto Cerdas'}
-                </span>
-              </div>
-              <div className="grid grid-cols-4 gap-1.5 text-xs">
-                {[
-                  { id: 'smart_auto' as ReframeMode, label: '🎯 Auto Cerdas' },
-                  { id: 'speaker' as ReframeMode, label: '👤 Pembicara' },
-                  { id: 'action' as ReframeMode, label: '⚡ Aksi' },
-                  { id: 'center' as ReframeMode, label: '📍 Tengah' },
-                ].map((m) => (
-                  <button
-                    key={m.id}
-                    onClick={() => setSettings((prev) => ({ ...prev, reframeMode: m.id }))}
-                    className={`py-1.5 px-1 rounded-xl border text-[11px] font-medium transition cursor-pointer text-center ${
-                      (settings.reframeMode || 'smart_auto') === m.id
-                        ? 'bg-cyan-500/25 border-cyan-400 text-white font-bold'
-                        : 'bg-black/30 border-white/5 text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    {m.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* 6. PROTEKSI ANTI-COPYRIGHT FACEBOOK & REELS */}
-            <div className="glass-card rounded-2xl p-3 border border-blue-500/30 bg-blue-950/20 space-y-2.5">
+            {/* ================= 7. PROTEKSI ANTI-COPYRIGHT FACEBOOK & REELS ================= */}
+            <div className="glass-card rounded-2xl p-3.5 border border-blue-500/30 bg-blue-950/20 space-y-2.5">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Shield className="w-4 h-4 text-blue-400" />
-                  <span className="text-xs font-bold text-white">Proteksi Anti-Copyright FB</span>
+                  <span className="text-xs font-bold text-white">Proteksi Anti-Copyright FB & Reels</span>
                   <span
                     className={`px-1.5 py-0.2 rounded text-[9px] font-bold border ${
                       antiSettings.enabled
@@ -1036,11 +1353,11 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                     onClick={() => updateAntiSettings({ flipHorizontal: !antiSettings.flipHorizontal })}
                     className={`p-1.5 rounded-lg border text-center transition cursor-pointer ${
                       antiSettings.flipHorizontal
-                        ? 'bg-blue-500/20 border-blue-400 text-blue-200'
+                        ? 'bg-blue-500/20 border-blue-400 text-blue-200 font-bold'
                         : 'bg-white/5 border-white/5 text-slate-400'
                     }`}
                   >
-                    <div className="font-bold">Mirror {antiSettings.flipHorizontal ? '✓' : '✗'}</div>
+                    <div>Mirror {antiSettings.flipHorizontal ? '✓' : '✗'}</div>
                     <div className="text-[8px] text-slate-400">Balik Video</div>
                   </button>
 
@@ -1048,11 +1365,11 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                     onClick={() => updateAntiSettings({ microSpeed: !antiSettings.microSpeed })}
                     className={`p-1.5 rounded-lg border text-center transition cursor-pointer ${
                       antiSettings.microSpeed
-                        ? 'bg-blue-500/20 border-blue-400 text-blue-200'
+                        ? 'bg-blue-500/20 border-blue-400 text-blue-200 font-bold'
                         : 'bg-white/5 border-white/5 text-slate-400'
                     }`}
                   >
-                    <div className="font-bold">Tempo 1.02x {antiSettings.microSpeed ? '✓' : '✗'}</div>
+                    <div>Tempo 1.02x {antiSettings.microSpeed ? '✓' : '✗'}</div>
                     <div className="text-[8px] text-slate-400">Pecah Hash Audio</div>
                   </button>
 
@@ -1060,11 +1377,11 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                     onClick={() => updateAntiSettings({ audioEqShift: !antiSettings.audioEqShift })}
                     className={`p-1.5 rounded-lg border text-center transition cursor-pointer ${
                       antiSettings.audioEqShift
-                        ? 'bg-blue-500/20 border-blue-400 text-blue-200'
+                        ? 'bg-blue-500/20 border-blue-400 text-blue-200 font-bold'
                         : 'bg-white/5 border-white/5 text-slate-400'
                     }`}
                   >
-                    <div className="font-bold">Audio EQ {antiSettings.audioEqShift ? '✓' : '✗'}</div>
+                    <div>Audio EQ {antiSettings.audioEqShift ? '✓' : '✗'}</div>
                     <div className="text-[8px] text-slate-400">Anti-Fingerprint</div>
                   </button>
                 </div>
@@ -1073,10 +1390,13 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           </div>
         </div>
 
-        {/* Footer actions */}
-        <div className="px-6 py-4 border-t border-white/10 bg-black/40 flex items-center justify-between">
-          <div className="text-xs font-mono text-slate-400">
-            {effectiveClipsToExport.length} Klip terpilih (Total ~{totalExportDuration.toFixed(1)}s)
+        {/* Footer Actions */}
+        <div className="px-5 sm:px-6 py-4 border-t border-white/10 bg-black/40 flex items-center justify-between flex-wrap gap-3">
+          <div className="text-xs font-mono text-slate-300">
+            {effectiveClipsToExport.length} Klip terpilih (Total ~{totalExportDuration.toFixed(1)}s) •{' '}
+            <span className={includeTagline ? 'text-amber-300' : 'text-cyan-300'}>
+              {includeTagline ? 'Dengan Tegline' : 'Tanpa Tegline (Polos)'}
+            </span>
           </div>
 
           <div className="flex items-center gap-3">
@@ -1095,8 +1415,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               <Download className={`w-4 h-4 ${isRendering ? 'animate-bounce' : ''}`} />
               <span>
                 {isRendering
-                  ? 'Sedang Merender...'
-                  : `Render & Download (${effectiveClipsToExport.length} Klip)`}
+                  ? 'Sedang Memproses Antrean...'
+                  : exportMode === 'individual'
+                  ? `⚡ Mulai Render Antrean (${effectiveClipsToExport.length} Klip Terpisah)`
+                  : `🎬 Render & Gabung (${effectiveClipsToExport.length} Klip Jadi 1)`}
               </span>
             </button>
           </div>

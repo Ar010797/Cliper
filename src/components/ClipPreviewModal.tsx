@@ -15,6 +15,7 @@ import {
   ChevronRight,
   Eye,
   Check,
+  Ban,
 } from 'lucide-react';
 import { VideoClip, ExportSettings, TextOverlay, ReframeMode, DEFAULT_ANTI_COPYRIGHT } from '../types';
 import { AutoReframer } from '../utils/autoReframing';
@@ -68,9 +69,9 @@ export const ClipPreviewModal: React.FC<ClipPreviewModalProps> = ({
   // Sync edited tagline when active clip changes
   useEffect(() => {
     if (clip) {
-      setEditedTagline(clip.tagline || overlay.text || '');
+      setEditedTagline(clip.tagline ?? '');
     }
-  }, [clip?.id, clip?.tagline, overlay.text]);
+  }, [clip?.id, clip?.tagline]);
 
   // Setup video source and seek to clip start when opened or clip changes
   useEffect(() => {
@@ -146,7 +147,7 @@ export const ClipPreviewModal: React.FC<ClipPreviewModalProps> = ({
             canvas.height = h;
           }
 
-          const currentClipTagline = clip.tagline || editedTagline || overlay.text;
+          const currentClipTagline = (editedTagline !== undefined ? editedTagline : (clip.tagline ?? '')).trim();
           const currentBadge = clip.taglineBadge || overlay.taglineBadge;
 
           const effectiveSettings: ExportSettings = {
@@ -158,8 +159,8 @@ export const ClipPreviewModal: React.FC<ClipPreviewModalProps> = ({
             overlay: {
               ...overlay,
               enabled: Boolean(currentClipTagline),
-              text: currentClipTagline || '',
-              taglineBadge: currentBadge || '🔥 VIRAL HOOK',
+              text: currentClipTagline,
+              taglineBadge: currentClipTagline ? (currentBadge || '🔥 VIRAL HOOK') : '',
               presetStyle: 'tiktok_yellow',
             },
           };
@@ -463,29 +464,52 @@ export const ClipPreviewModal: React.FC<ClipPreviewModalProps> = ({
                 />
 
                 {/* 1-Click Alternative Tagline Chips */}
-                {clip.suggestedTaglines && clip.suggestedTaglines.length > 0 && (
-                  <div className="space-y-1.5 pt-1">
-                    <span className="text-[10px] text-slate-400 font-semibold block">
-                      ⚡ Klik untuk mengganti tegline secara instan:
-                    </span>
-                    <div className="flex flex-wrap gap-1.5">
-                      {clip.suggestedTaglines.map((sug, sIdx) => (
-                        <button
-                          key={sIdx}
-                          type="button"
-                          onClick={() => handleApplySuggestion(sug)}
-                          className={`text-[11px] px-2.5 py-1 rounded-xl border text-left transition cursor-pointer ${
-                            (clip.tagline || editedTagline) === sug
-                              ? 'bg-amber-500/30 text-amber-200 border-amber-500/60 font-bold shadow-sm'
-                              : 'bg-white/5 hover:bg-white/15 text-slate-300 hover:text-white border-white/10'
-                          }`}
-                        >
-                          {sug}
-                        </button>
-                      ))}
-                    </div>
+                <div className="space-y-1.5 pt-1">
+                  <div className="flex items-center justify-between text-[10px] text-slate-400 font-semibold">
+                    <span>⚡ Pilihan Cepat Tegline:</span>
+                    {editedTagline && (
+                      <button
+                        type="button"
+                        onClick={() => handleApplySuggestion('')}
+                        className="text-rose-400 hover:text-rose-300 font-bold cursor-pointer transition flex items-center gap-1"
+                      >
+                        <Ban className="w-3 h-3" />
+                        <span>Hapus Tegline</span>
+                      </button>
+                    )}
                   </div>
-                )}
+                  <div className="flex flex-wrap gap-1.5">
+                    {/* Opsi Tanpa Tegline */}
+                    <button
+                      type="button"
+                      onClick={() => handleApplySuggestion('')}
+                      className={`text-[11px] px-2.5 py-1 rounded-xl border text-left transition cursor-pointer flex items-center gap-1 ${
+                        !editedTagline
+                          ? 'bg-rose-500/25 text-rose-200 border-rose-500/50 font-bold shadow-sm'
+                          : 'bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white border-white/10'
+                      }`}
+                      title="Simpan video tanpa teks tegline (video bersih)"
+                    >
+                      <Ban className="w-3.5 h-3.5" />
+                      <span>🚫 Tanpa Tegline</span>
+                    </button>
+
+                    {clip.suggestedTaglines && clip.suggestedTaglines.map((sug, sIdx) => (
+                      <button
+                        key={sIdx}
+                        type="button"
+                        onClick={() => handleApplySuggestion(sug)}
+                        className={`text-[11px] px-2.5 py-1 rounded-xl border text-left transition cursor-pointer ${
+                          editedTagline === sug
+                            ? 'bg-amber-500/30 text-amber-200 border-amber-500/60 font-bold shadow-sm'
+                            : 'bg-white/5 hover:bg-white/15 text-slate-300 hover:text-white border-white/10'
+                        }`}
+                      >
+                        {sug}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </div>
 
               {/* Prev / Next Clip Switcher */}

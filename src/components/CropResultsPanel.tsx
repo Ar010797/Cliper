@@ -32,6 +32,7 @@ import {
   Target,
   UserCheck,
   MoveHorizontal,
+  Ban,
 } from 'lucide-react';
 import {
   ExportSettings,
@@ -59,6 +60,7 @@ import {
   getOutputDimensions,
   renderVideoFrameWithEffects,
 } from '../utils/exportEngine';
+import { triggerSafeDownload } from '../utils/downloadHelper';
 import { ClipPreviewModal } from './ClipPreviewModal';
 
 interface CropResultsPanelProps {
@@ -274,14 +276,23 @@ export const CropResultsPanel: React.FC<CropResultsPanelProps> = ({
             cam = autoReframerRef.current.update(pVideo);
           }
 
+          const activeTagline = (activeClip?.tagline !== undefined ? activeClip.tagline : (overlay.text || '')).trim();
           renderVideoFrameWithEffects(
             ctx,
             pVideo,
             pW,
             pH,
-            effectiveSettings,
-            activeClip?.tagline || overlay.text,
-            activeClip?.taglineBadge || overlay.taglineBadge,
+            {
+              ...effectiveSettings,
+              overlay: {
+                ...effectiveSettings.overlay,
+                enabled: Boolean(activeTagline),
+                text: activeTagline,
+                taglineBadge: activeTagline ? (activeClip?.taglineBadge || overlay.taglineBadge) : '',
+              },
+            },
+            activeTagline,
+            activeTagline ? (activeClip?.taglineBadge || overlay.taglineBadge) : '',
             { x: cam.currentFocalX, y: cam.currentFocalY }
           );
 
@@ -560,6 +571,7 @@ export const CropResultsPanel: React.FC<CropResultsPanelProps> = ({
     setRenderProgress({ percent: 5, status: `Menyiapkan render klip ${clip.name} (Anti-Copyright Shield Aktif)...` });
 
     try {
+      const taglineText = (clip.tagline !== undefined ? clip.tagline : (overlay.text || '')).trim();
       const clipSettings: ExportSettings = {
         ...exportSettings,
         aspectRatio: '9:16', // Format 9:16 ideal untuk viral
@@ -570,9 +582,9 @@ export const CropResultsPanel: React.FC<CropResultsPanelProps> = ({
         manualFocalX,
         overlay: {
           ...overlay,
-          enabled: true,
-          text: clip.tagline || overlay.text,
-          taglineBadge: clip.taglineBadge || overlay.taglineBadge,
+          enabled: Boolean(taglineText),
+          text: taglineText,
+          taglineBadge: taglineText ? (clip.taglineBadge || overlay.taglineBadge) : '',
           presetStyle: 'tiktok_yellow',
         },
       };
@@ -584,17 +596,16 @@ export const CropResultsPanel: React.FC<CropResultsPanelProps> = ({
         (prog) => setRenderProgress(prog)
       );
 
-      // Trigger automatic download
-      const url = URL.createObjectURL(result.blob);
-      const a = document.createElement('a');
-      a.href = url;
+      // Trigger safe download that works reliably on Android Chrome, iOS Safari, and Desktop
       const cleanName = (clip.name || 'viral_clip').replace(/[^a-zA-Z0-9_-]/g, '_');
-      a.download = `cliprush_viral_${cleanName}_anticopyright.${clipSettings.format === 'webm' ? 'webm' : 'mp4'}`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
+      const filename = `cliprush_viral_${cleanName}_anticopyright.${clipSettings.format === 'webm' ? 'webm' : 'mp4'}`;
+      const { success } = triggerSafeDownload(result.blob, filename);
 
-      onToast('success', `✨ Klip "${clip.name}" berhasil didownload! Bebas klaim hak cipta FB.`);
+      if (success) {
+        onToast('success', `✨ Klip "${clip.name}" berhasil disimpan ke perangkat! Bebas klaim hak cipta FB.`);
+      } else {
+        onToast('info', `Render selesai. Jika file belum otomatis tersimpan, silakan periksa izin download browser.`);
+      }
     } catch (err: unknown) {
       const error = err as Error;
       onToast('error', `Gagal download klip: ${error.message}`);
@@ -622,6 +633,7 @@ export const CropResultsPanel: React.FC<CropResultsPanelProps> = ({
           status: `Merender klip ${i + 1}/${clips.length} (${clip.name}) [Proteksi Anti-Copyright FB]...`,
         });
 
+        const taglineText = (clip.tagline !== undefined ? clip.tagline : (overlay.text || '')).trim();
         const clipSettings: ExportSettings = {
           ...exportSettings,
           aspectRatio: '9:16',
@@ -632,9 +644,9 @@ export const CropResultsPanel: React.FC<CropResultsPanelProps> = ({
           manualFocalX,
           overlay: {
             ...overlay,
-            enabled: true,
-            text: clip.tagline || overlay.text,
-            taglineBadge: clip.taglineBadge || overlay.taglineBadge,
+            enabled: Boolean(taglineText),
+            text: taglineText,
+            taglineBadge: taglineText ? (clip.taglineBadge || overlay.taglineBadge) : '',
             presetStyle: 'tiktok_yellow',
           },
         };
@@ -653,14 +665,9 @@ export const CropResultsPanel: React.FC<CropResultsPanelProps> = ({
           }
         );
 
-        const url = URL.createObjectURL(result.blob);
-        const a = document.createElement('a');
-        a.href = url;
         const cleanName = (clip.name || `clip_${i + 1}`).replace(/[^a-zA-Z0-9_-]/g, '_');
-        a.download = `cliprush_${cleanName}_fb_ready.${clipSettings.format === 'webm' ? 'webm' : 'mp4'}`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+        const filename = `cliprush_${cleanName}_fb_ready.${clipSettings.format === 'webm' ? 'webm' : 'mp4'}`;
+        triggerSafeDownload(result.blob, filename);
       }
 
       onToast('success', `🎉 Semua ${clips.length} klip viral berhasil didownload dengan Proteksi Anti-Copyright FB!`);
@@ -883,6 +890,42 @@ export const CropResultsPanel: React.FC<CropResultsPanelProps> = ({
                   <span>{m.label}</span>
                 </button>
               ))}
+            </div>
+            <div className="flex items-center gap-1 bg-black/40 p-1 rounded-xl border border-white/10 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  handleApplyKeywordAndSync(customKeyword || contextInfo.cleanSubject, selectedTopic);
+                  onToast('success', 'Tegline otomatis sesuai isi klip diaktifkan!');
+                }}
+                className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition cursor-pointer flex items-center gap-1 ${
+                  clips.some((c) => c.tagline && c.tagline.trim())
+                    ? 'bg-amber-500 text-slate-950 shadow-sm'
+                    : 'text-slate-400 hover:text-white hover:bg-white/5'
+                }`}
+                title="Aktifkan tegline otomatis sesuai pembahasan video untuk semua klip"
+              >
+                <Tag className="w-3 h-3" />
+                <span>Tegline Otomatis</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const updated = clips.map((c) => ({ ...c, tagline: '' }));
+                  setClips(updated);
+                  setOverlay((prev) => ({ ...prev, text: '' }));
+                  onToast('info', 'Semua klip diatur tanpa tegline (video polos).');
+                }}
+                className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition cursor-pointer flex items-center gap-1 ${
+                  !clips.some((c) => c.tagline && c.tagline.trim())
+                    ? 'bg-rose-500/30 text-rose-200 border border-rose-500/50 shadow-sm'
+                    : 'text-slate-400 hover:text-white hover:bg-white/5'
+                }`}
+                title="Hapus tegline dari semua klip (video bersih)"
+              >
+                <Ban className="w-3 h-3" />
+                <span>Tanpa Tegline</span>
+              </button>
             </div>
           </div>
           <span className="text-[11px] text-slate-400 italic">
@@ -1530,31 +1573,56 @@ export const CropResultsPanel: React.FC<CropResultsPanelProps> = ({
                           />
                         </div>
 
-                        {/* 1-Click Alternative Tagline Suggestions */}
-                        {clip.suggestedTaglines && clip.suggestedTaglines.length > 0 && (
-                          <div className="pt-1 space-y-1">
-                            <span className="text-[10px] text-slate-400 flex items-center gap-1 font-medium">
-                              <span>⚡ Pilihan Cepat Tegline Lain:</span>
+                        {/* 1-Click Alternative Tagline Suggestions & Tanpa Tegline Option */}
+                        <div className="pt-1 space-y-1">
+                          <div className="flex items-center justify-between text-[10px] text-slate-400 font-medium">
+                            <span className="flex items-center gap-1">
+                              <span>⚡ Pilihan Cepat Tegline:</span>
                             </span>
-                            <div className="flex flex-wrap gap-1.5">
-                              {clip.suggestedTaglines.slice(0, 4).map((sug, sIdx) => (
-                                <button
-                                  key={sIdx}
-                                  type="button"
-                                  onClick={() => handleUpdateClipTagline(clip.id, sug)}
-                                  className={`text-[10px] px-2 py-0.5 rounded-lg border text-left transition cursor-pointer ${
-                                    clip.tagline === sug
-                                      ? 'bg-amber-500/30 text-amber-200 border-amber-500/60 font-bold shadow-sm'
-                                      : 'bg-white/5 hover:bg-white/15 text-slate-300 hover:text-white border-white/10'
-                                  }`}
-                                  title="Klik untuk langsung terapkan tegline ini"
-                                >
-                                  {sug}
-                                </button>
-                              ))}
-                            </div>
+                            {clip.tagline && (
+                              <button
+                                type="button"
+                                onClick={() => handleUpdateClipTagline(clip.id, '')}
+                                className="text-rose-400 hover:text-rose-300 font-bold cursor-pointer transition flex items-center gap-1"
+                              >
+                                <Ban className="w-3 h-3" />
+                                <span>Hapus Tegline</span>
+                              </button>
+                            )}
                           </div>
-                        )}
+                          <div className="flex flex-wrap gap-1.5">
+                            {/* Pilihan Tanpa Tegline */}
+                            <button
+                              type="button"
+                              onClick={() => handleUpdateClipTagline(clip.id, '')}
+                              className={`text-[10px] px-2 py-0.5 rounded-lg border text-left transition cursor-pointer flex items-center gap-1 ${
+                                !clip.tagline
+                                  ? 'bg-rose-500/25 text-rose-200 border-rose-500/50 font-bold shadow-sm'
+                                  : 'bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white border-white/10'
+                              }`}
+                              title="Jangan tampilkan tegline pada klip ini (video polos)"
+                            >
+                              <Ban className="w-3 h-3" />
+                              <span>🚫 Tanpa Tegline</span>
+                            </button>
+
+                            {clip.suggestedTaglines && clip.suggestedTaglines.slice(0, 4).map((sug, sIdx) => (
+                              <button
+                                key={sIdx}
+                                type="button"
+                                onClick={() => handleUpdateClipTagline(clip.id, sug)}
+                                className={`text-[10px] px-2 py-0.5 rounded-lg border text-left transition cursor-pointer ${
+                                  clip.tagline === sug
+                                    ? 'bg-amber-500/30 text-amber-200 border-amber-500/60 font-bold shadow-sm'
+                                    : 'bg-white/5 hover:bg-white/15 text-slate-300 hover:text-white border-white/10'
+                                }`}
+                                title="Klik untuk langsung terapkan tegline ini"
+                              >
+                                {sug}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
                       </div>
 
                       {/* Penyesuaian Durasi Klip (Fine-Tune Trim - Durasi Bebas >60s) */}
