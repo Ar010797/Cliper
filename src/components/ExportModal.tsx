@@ -27,6 +27,8 @@ import {
   FileVideo,
   ListOrdered,
   Clock,
+  Share2,
+  Smartphone,
 } from 'lucide-react';
 import { ExportSettings, VideoClip, AntiCopyrightSettings, DEFAULT_ANTI_COPYRIGHT, ReframeMode } from '../types';
 import { AutoReframer } from '../utils/autoReframing';
@@ -36,7 +38,14 @@ import {
   getOutputDimensions,
   renderVideoFrameWithEffects,
 } from '../utils/exportEngine';
-import { triggerSafeDownload, formatFileSize } from '../utils/downloadHelper';
+import {
+  triggerSafeDownload,
+  formatFileSize,
+  shareVideoFile,
+  canShareFiles,
+  isMedianEnvironment,
+} from '../utils/downloadHelper';
+import { DownloadSuccessModal } from './DownloadSuccessModal';
 
 export interface QueueClipItem {
   id: string;
@@ -101,6 +110,14 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     blob: Blob;
     url: string;
     filename: string;
+  } | null>(null);
+
+  // Dedicated download success modal state for Median & mobile devices
+  const [downloadSuccessData, setDownloadSuccessData] = useState<{
+    blob: Blob | null;
+    url: string;
+    filename: string;
+    httpUrl?: string;
   } | null>(null);
 
   // Download all in progress state
@@ -865,18 +882,37 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                           </div>
                         </div>
 
-                        {/* Direct Download Button for Each Completed Clip */}
+                        {/* Direct Download & Share Buttons for Each Completed Clip */}
                         <div className="flex items-center gap-1.5 shrink-0">
-                          {isDone && item.url && item.filename && (
-                            <a
-                              href={item.url}
-                              download={item.filename}
+                          {isDone && item.blob && item.filename && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const { url } = triggerSafeDownload(item.blob!, item.filename!, (httpUrl) => {
+                                  setDownloadSuccessData((prev) => (prev && prev.filename === item.filename ? { ...prev, httpUrl } : prev));
+                                });
+                                setDownloadSuccessData({
+                                  blob: item.blob!,
+                                  url: item.url || url,
+                                  filename: item.filename!,
+                                });
+                              }}
                               className="px-3 py-1.5 rounded-xl font-bold text-xs bg-emerald-500 hover:bg-emerald-400 text-slate-950 flex items-center gap-1.5 shadow-md transition cursor-pointer active:scale-95"
                               title="Klik untuk langsung menyimpan file ini ke HP / Komputer"
                             >
                               <Download className="w-3.5 h-3.5" />
                               <span>Simpan File</span>
-                            </a>
+                            </button>
+                          )}
+                          {isDone && item.blob && item.filename && canShareFiles() && (
+                            <button
+                              type="button"
+                              onClick={() => shareVideoFile(item.blob!, item.filename!)}
+                              className="p-1.5 rounded-xl bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 cursor-pointer transition active:scale-95"
+                              title="Simpan ke Galeri / Bagikan File"
+                            >
+                              <Share2 className="w-3.5 h-3.5" />
+                            </button>
                           )}
                           {isDone && item.url && (
                             <button
@@ -919,14 +955,36 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                   <video src={exportResult.url} controls className="w-full h-full object-contain" />
                 </div>
 
-                <button
-                  type="button"
-                  onClick={() => triggerSafeDownload(exportResult.blob, exportResult.filename)}
-                  className="inline-flex items-center gap-2 px-6 py-2.5 rounded-xl font-bold text-xs bg-gradient-to-r from-emerald-500 to-teal-400 hover:from-emerald-400 hover:to-teal-300 text-slate-950 transition shadow-lg shadow-emerald-500/20 active:scale-95 cursor-pointer"
-                >
-                  <Download className="w-4 h-4" />
-                  <span>Simpan Video ke Perangkat Sekarang</span>
-                </button>
+                <div className="flex flex-col sm:flex-row items-center justify-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const { url } = triggerSafeDownload(exportResult.blob, exportResult.filename, (httpUrl) => {
+                        setDownloadSuccessData((prev) => (prev && prev.filename === exportResult.filename ? { ...prev, httpUrl } : prev));
+                      });
+                      setDownloadSuccessData({
+                        blob: exportResult.blob,
+                        url: exportResult.url || url,
+                        filename: exportResult.filename,
+                      });
+                    }}
+                    className="inline-flex items-center gap-2 px-6 py-2.5 rounded-xl font-bold text-xs bg-gradient-to-r from-emerald-500 to-teal-400 hover:from-emerald-400 hover:to-teal-300 text-slate-950 transition shadow-lg shadow-emerald-500/20 active:scale-95 cursor-pointer"
+                  >
+                    <Download className="w-4 h-4" />
+                    <span>Simpan Video ke Perangkat Sekarang</span>
+                  </button>
+
+                  {canShareFiles() && (
+                    <button
+                      type="button"
+                      onClick={() => shareVideoFile(exportResult.blob, exportResult.filename)}
+                      className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl font-bold text-xs bg-cyan-600/30 hover:bg-cyan-600/50 text-cyan-200 border border-cyan-400/50 transition shadow-lg active:scale-95 cursor-pointer"
+                    >
+                      <Share2 className="w-4 h-4" />
+                      <span>Simpan ke Galeri / Bagikan</span>
+                    </button>
+                  )}
+                </div>
               </div>
             )}
 
@@ -1424,6 +1482,18 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Median / Android Friendly Download Success Modal */}
+      {downloadSuccessData && (
+        <DownloadSuccessModal
+          isOpen={Boolean(downloadSuccessData)}
+          onClose={() => setDownloadSuccessData(null)}
+          videoBlob={downloadSuccessData.blob}
+          videoUrl={downloadSuccessData.url}
+          filename={downloadSuccessData.filename}
+          httpUrl={downloadSuccessData.httpUrl}
+        />
+      )}
     </div>
   );
 };

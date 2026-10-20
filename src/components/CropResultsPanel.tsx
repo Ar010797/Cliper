@@ -60,8 +60,9 @@ import {
   getOutputDimensions,
   renderVideoFrameWithEffects,
 } from '../utils/exportEngine';
-import { triggerSafeDownload } from '../utils/downloadHelper';
+import { triggerSafeDownload, shareVideoFile, canShareFiles } from '../utils/downloadHelper';
 import { ClipPreviewModal } from './ClipPreviewModal';
+import { DownloadSuccessModal } from './DownloadSuccessModal';
 
 interface CropResultsPanelProps {
   videoElement: HTMLVideoElement | null;
@@ -125,6 +126,14 @@ export const CropResultsPanel: React.FC<CropResultsPanelProps> = ({
 
   // Dedicated Video Clip Preview Modal state
   const [previewingClip, setPreviewingClip] = useState<VideoClip | null>(null);
+
+  // Download success modal state for Median & mobile devices
+  const [downloadSuccessData, setDownloadSuccessData] = useState<{
+    blob: Blob | null;
+    url: string;
+    filename: string;
+    httpUrl?: string;
+  } | null>(null);
 
   // Inline tagline editor for active clip
   const [isEditingTagline, setIsEditingTagline] = useState<boolean>(false);
@@ -596,15 +605,21 @@ export const CropResultsPanel: React.FC<CropResultsPanelProps> = ({
         (prog) => setRenderProgress(prog)
       );
 
-      // Trigger safe download that works reliably on Android Chrome, iOS Safari, and Desktop
+      // Trigger safe download that works reliably on Median.co, Android WebView, iOS Safari, and Desktop
       const cleanName = (clip.name || 'viral_clip').replace(/[^a-zA-Z0-9_-]/g, '_');
       const filename = `cliprush_viral_${cleanName}_anticopyright.${clipSettings.format === 'webm' ? 'webm' : 'mp4'}`;
-      const { success } = triggerSafeDownload(result.blob, filename);
+      const { success, url } = triggerSafeDownload(result.blob, filename, (httpUrl) => {
+        setDownloadSuccessData((prev) => (prev && prev.filename === filename ? { ...prev, httpUrl } : prev));
+      });
+
+      setDownloadSuccessData({
+        blob: result.blob,
+        url,
+        filename,
+      });
 
       if (success) {
-        onToast('success', `✨ Klip "${clip.name}" berhasil disimpan ke perangkat! Bebas klaim hak cipta FB.`);
-      } else {
-        onToast('info', `Render selesai. Jika file belum otomatis tersimpan, silakan periksa izin download browser.`);
+        onToast('success', `✨ Klip "${clip.name}" berhasil disimpan ke perangkat!`);
       }
     } catch (err: unknown) {
       const error = err as Error;
@@ -1811,6 +1826,18 @@ export const CropResultsPanel: React.FC<CropResultsPanelProps> = ({
         isDownloading={downloadingClipId !== null}
         reframeMode={reframeMode}
       />
+
+      {/* Median / Mobile Friendly Download Success Modal */}
+      {downloadSuccessData && (
+        <DownloadSuccessModal
+          isOpen={Boolean(downloadSuccessData)}
+          onClose={() => setDownloadSuccessData(null)}
+          videoBlob={downloadSuccessData.blob}
+          videoUrl={downloadSuccessData.url}
+          filename={downloadSuccessData.filename}
+          httpUrl={downloadSuccessData.httpUrl}
+        />
+      )}
     </div>
   );
 };

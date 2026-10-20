@@ -39,6 +39,105 @@ async function startServer() {
     res.json({ status: 'ok', time: new Date().toISOString() });
   });
 
+  // Temp downloads directory for native Android WebView / Median.co / iOS downloads
+  const tempDownloadsDir = path.resolve(__dirname, 'public/temp_downloads');
+  if (!fs.existsSync(tempDownloadsDir)) {
+    fs.mkdirSync(tempDownloadsDir, { recursive: true });
+  }
+
+  // Periodic cleanup of temp files older than 30 minutes
+  setInterval(() => {
+    try {
+      if (fs.existsSync(tempDownloadsDir)) {
+        const files = fs.readdirSync(tempDownloadsDir);
+        const now = Date.now();
+        for (const f of files) {
+          const fp = path.join(tempDownloadsDir, f);
+          const stat = fs.statSync(fp);
+          if (now - stat.mtimeMs > 30 * 60 * 1000) {
+            fs.unlinkSync(fp);
+          }
+        }
+      }
+    } catch {
+      // ignore cleanup errors
+    }
+  }, 10 * 60 * 1000);
+
+  // API: Upload rendered clip to server so Median & mobile WebViews can download via native HTTP URL
+  app.post('/api/upload-temp-video', (req: Request, res: Response) => {
+    try {
+      const rawFilename = (req.query.filename as string) || `cliprush_${Date.now()}.mp4`;
+      const cleanFilename = rawFilename.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const id = `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+      const ext = cleanFilename.endsWith('.webm') ? '.webm' : '.mp4';
+      const savedName = `${id}${ext}`;
+      const filePath = path.join(tempDownloadsDir, savedName);
+
+      const writeStream = fs.createWriteStream(filePath);
+      req.pipe(writeStream);
+
+      writeStream.on('finish', () => {
+        const stats = fs.statSync(filePath);
+        const downloadUrl = `/api/download-file?id=${id}&filename=${encodeURIComponent(cleanFilename)}`;
+        res.json({
+          success: true,
+          id,
+          filename: cleanFilename,
+          size: stats.size,
+          downloadUrl,
+        });
+      });
+
+      writeStream.on('error', (err) => {
+        console.error('Error saving temp video upload:', err);
+        res.status(500).json({ success: false, error: 'Gagal menyimpan file video di server.' });
+      });
+    } catch (e: unknown) {
+      const error = e as Error;
+      res.status(500).json({ success: false, error: error?.message || 'Server error' });
+    }
+  });
+
+  // API: Download file with explicit Content-Disposition and HTTP headers for native DownloadManager
+  app.get('/api/download-file', (req: Request, res: Response) => {
+    const id = req.query.id as string;
+    const clientFilename = (req.query.filename as string) || 'cliprush_video.mp4';
+    if (!id || typeof id !== 'string') {
+      res.status(400).send('Parameter id tidak valid');
+      return;
+    }
+
+    const safeId = id.replace(/[^a-zA-Z0-9_]/g, '');
+    const mp4Path = path.join(tempDownloadsDir, `${safeId}.mp4`);
+    const webmPath = path.join(tempDownloadsDir, `${safeId}.webm`);
+
+    let targetPath = '';
+    if (fs.existsSync(mp4Path)) {
+      targetPath = mp4Path;
+    } else if (fs.existsSync(webmPath)) {
+      targetPath = webmPath;
+    }
+
+    if (!targetPath) {
+      res.status(404).send('File video tidak ditemukan atau sudah kadaluarsa.');
+      return;
+    }
+
+    const stat = fs.statSync(targetPath);
+    const isWebm = targetPath.endsWith('.webm');
+    const contentType = isWebm ? 'video/webm' : 'video/mp4';
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Content-Disposition', `attachment; filename="${clientFilename.replace(/"/g, '')}"`);
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Accept-Ranges', 'bytes');
+
+    const readStream = fs.createReadStream(targetPath);
+    readStream.pipe(res);
+  });
+
   // API: List hosted sample videos
   app.get('/api/samples', (req: Request, res: Response) => {
     res.json({
